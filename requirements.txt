@@ -1,6 +1,5 @@
 streamlit
 pandas
 yfinance
-plotly
+plotly-express
 vnstock
-datetime
