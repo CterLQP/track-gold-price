@@ -20,6 +20,7 @@ LOGO_URL_SIDEBAR = "https://res.cloudinary.com/dd7gti2kn/image/upload/v174567818
 SJC_FETCH_INTERVAL_DAYS = 7 # Fetch SJC data every 7 days
 SJC_FETCH_DELAY_SECONDS = 2 # Delay between SJC API calls
 SJC_TARGET_BRANCH = 'Hồ Chí Minh' # Branch to filter SJC prices for consistency
+CACHE_TTL_SECONDS = 10800 # Cache data for 3 hours (3 * 60 * 60)
 
 # --- Set Page Config FIRST ---
 st.set_page_config(
@@ -79,25 +80,41 @@ st.markdown("""
 
 
 # --- Data Fetching Function (World Gold & Forex) ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
 def fetch_world_historical_data(start_date, end_date):
+    """Fetches world gold and forex data."""
     try:
+        # Add a small delay before fetching yfinance data
+        time.sleep(0.5)
         gold_data = yf.download(GOLD_TICKER, start=start_date, end=end_date + timedelta(days=1), progress=False)
+        time.sleep(0.5) # Another small delay
         forex_data = yf.download(FOREX_TICKER, start=start_date, end=end_date + timedelta(days=1), progress=False)
         if gold_data.empty or forex_data.empty: return None, None
         return gold_data, forex_data
     except Exception as e:
-        print(f"Error fetching world data: {e}")
-        return None, None
+        # Check specifically for rate limit error if possible (yfinance might wrap it)
+        if 'YFRateLimitError' in str(e) or 'Too Many Requests' in str(e):
+             print(f"Yahoo Finance Rate Limit Error (World Data): {e}")
+             # Return None to indicate failure, caller will show error message
+             return None, None
+        else:
+             print(f"Error fetching world data: {e}")
+             return None, None
 
 # --- Data Fetching Function (SJC Historical via vnstock) ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
 def fetch_sjc_historical_data(start_date, end_date):
+    """
+    Fetches historical SJC gold prices using vnstock by iterating through dates.
+    Filters for a specific branch and sell price.
+    """
     all_sjc_prices = []
     current_date = start_date
     while current_date <= end_date:
         date_str = current_date.strftime("%Y-%m-%d")
         try:
+            # Add a small delay even for vnstock calls, just in case its source is also sensitive
+            time.sleep(0.2)
             prices = sjc_gold_price(date=date_str)
             if not prices.empty:
                 target_price = prices[prices['branch'] == SJC_TARGET_BRANCH]['sell_price']
@@ -106,7 +123,12 @@ def fetch_sjc_historical_data(start_date, end_date):
                     if pd.notna(price_value):
                          all_sjc_prices.append({'Timestamp': pd.to_datetime(current_date), 'Giá SJC (VND/cây)': price_value})
         except Exception as e:
-            print(f"Error fetching SJC on {date_str}: {e}")
+            # Check specifically for rate limit error if possible (less likely for vnstock source?)
+            if 'Too Many Requests' in str(e):
+                 print(f"Rate Limit Error (SJC Data) on {date_str}: {e}")
+                 # Optionally break or just continue, hoping later calls succeed
+            else:
+                 print(f"Error fetching SJC on {date_str}: {e}")
         current_date += timedelta(days=SJC_FETCH_INTERVAL_DAYS)
         if current_date <= end_date: time.sleep(SJC_FETCH_DELAY_SECONDS)
     if not all_sjc_prices: return pd.DataFrame()
@@ -181,21 +203,42 @@ world_gold_vnd_hist = pd.DataFrame()
 sjc_hist = pd.DataFrame()
 gold_hist = None
 forex_hist = None
-spread_chart_data = pd.DataFrame() # Initialize for spread chart
+spread_chart_data = pd.DataFrame()
 
 # --- Fetch World Data ---
+# Display error message outside the spinner if fetching fails
+fetch_world_success = False
 with st.spinner(f"Đang tải dữ liệu giá TG..."):
     gold_hist, forex_hist = fetch_world_historical_data(start_date, end_date)
-    if gold_hist is None or forex_hist is None: world_data_error = True
+    if gold_hist is None or forex_hist is None:
+        world_data_error = True
     else:
         world_gold_vnd_hist = calculate_world_gold_vnd(gold_hist, forex_hist)
-        if world_gold_vnd_hist.empty: world_data_error = True
+        if world_gold_vnd_hist.empty:
+            world_data_error = True
+        else:
+            fetch_world_success = True # Mark as success only if calculation also works
+
+if world_data_error:
+     st.warning("⚠️ Lỗi khi tải dữ liệu giá thế giới (có thể do giới hạn truy cập từ Yahoo Finance). Vui lòng thử lại sau.", icon="📉")
+elif fetch_world_success:
+     st.toast("Tải dữ liệu giá thế giới thành công!", icon="✅")
+
 
 # --- Fetch SJC Data ---
+fetch_sjc_success = False
 with st.spinner(f"Đang tải dữ liệu giá SJC (có thể mất vài phút)..."):
      sjc_hist = fetch_sjc_historical_data(start_date, end_date)
-     if sjc_hist.empty: sjc_data_error = True
-     else: sjc_hist['Timestamp'] = pd.to_datetime(sjc_hist['Timestamp'])
+     if sjc_hist.empty:
+         sjc_data_error = True
+     else:
+         sjc_hist['Timestamp'] = pd.to_datetime(sjc_hist['Timestamp'])
+         fetch_sjc_success = True
+
+if not sjc_data_error and fetch_sjc_success:
+     st.toast("Tải dữ liệu SJC thành công!", icon="✅")
+# No explicit error message here, handled by chart display logic
+
 
 # --- Display Metrics ---
 col1, col2, col3 = st.columns(3)
@@ -240,24 +283,20 @@ with col2:
               value=f"{latest_sjc_price:,.0f} VND" if pd.notna(latest_sjc_price) else "N/A",
               delta=format_delta(delta_sjc), help=f"Giá vàng SJC tại {SJC_TARGET_BRANCH} (ngày gần nhất có dữ liệu)")
 
-# Metric 3: Spread (Calculated from latest available prices)
+# Metric 3: Spread
 latest_spread = None
 latest_spread_date_str = "N/A"
-delta_spread = None # Delta for spread is harder to calculate reliably with ffill, keep simple for now
+delta_spread = None
 spread_calculated_for_metric = False
 if pd.notna(latest_world_price) and pd.notna(latest_sjc_price):
     latest_spread = latest_sjc_price - latest_world_price
     latest_spread_date_str = f"~ {datetime.now().strftime('%d/%m')}"
     spread_calculated_for_metric = True
-    # Delta calculation for spread based on merged data (inner join) remains complex with ffill approach
-    # We will omit delta for spread metric for simplicity and accuracy based on latest values only.
-
 with col3:
     st.metric(label=f"Chênh lệch ({latest_spread_date_str})",
               value=f"{latest_spread:,.0f} VND" if spread_calculated_for_metric else "N/A",
               delta=None, # Omit delta for spread metric
               help="Chênh lệch giữa giá SJC và giá TG quy đổi mới nhất")
-
 
 st.divider()
 
@@ -283,27 +322,23 @@ else:
 
 # --- Calculate and Display Spread Chart using Forward Fill ---
 st.subheader("⚖️ Chênh lệch Giá (SJC - Thế Giới Quy Đổi)")
-spread_chart_data = pd.DataFrame() # Reset spread chart data
+spread_chart_data = pd.DataFrame()
 if not world_data_error and not sjc_data_error:
-    # Create a full date range based on world gold data
-    if not world_gold_vnd_hist.empty:
-        date_range = pd.date_range(start=world_gold_vnd_hist['Timestamp'].min(), end=world_gold_vnd_hist['Timestamp'].max(), freq='D')
+    if not world_gold_vnd_hist.empty and not sjc_hist.empty: # Ensure both DFs have data
+        date_range = pd.date_range(start=min(world_gold_vnd_hist['Timestamp'].min(), sjc_hist['Timestamp'].min()),
+                                   end=max(world_gold_vnd_hist['Timestamp'].max(), sjc_hist['Timestamp'].max()), freq='D')
         spread_chart_data = pd.DataFrame(index=date_range)
         spread_chart_data.index.name = 'Timestamp'
 
-        # Merge world gold data
         spread_chart_data = pd.merge(spread_chart_data, world_gold_vnd_hist.set_index('Timestamp'), left_index=True, right_index=True, how='left')
-
-        # Merge SJC data and forward fill
         sjc_indexed = sjc_hist.set_index('Timestamp')
         spread_chart_data = pd.merge(spread_chart_data, sjc_indexed, left_index=True, right_index=True, how='left')
-        spread_chart_data['Giá SJC (VND/cây)'].ffill(inplace=True) # Forward fill SJC prices
+        spread_chart_data['Giá SJC (VND/cây)'].ffill(inplace=True)
+        spread_chart_data.dropna(subset=['Giá TG Quy Đổi (VND/cây)', 'Giá SJC (VND/cây)'], inplace=True)
 
-        # Calculate spread where both values are available after ffill
-        spread_chart_data.dropna(subset=['Giá TG Quy Đổi (VND/cây)', 'Giá SJC (VND/cây)'], inplace=True) # Ensure both prices exist
         if not spread_chart_data.empty:
             spread_chart_data['Chênh lệch (SJC - TG)'] = spread_chart_data['Giá SJC (VND/cây)'] - spread_chart_data['Giá TG Quy Đổi (VND/cây)']
-            spread_chart_data.reset_index(inplace=True) # Reset index for plotting
+            spread_chart_data.reset_index(inplace=True)
 
 if spread_chart_data.empty or 'Chênh lệch (SJC - TG)' not in spread_chart_data.columns:
     st.warning("Không thể tính hoặc vẽ biểu đồ chênh lệch (thiếu dữ liệu TG hoặc SJC).")
@@ -313,7 +348,6 @@ else:
     fig_spread.update_traces(line_color='#2ca02c', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Chênh lệch: %{y:,.0f}<extra></extra>")
     fig_spread.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
     st.plotly_chart(fig_spread, use_container_width=True)
-
 
 # --- Display Raw Data (Optional Expander) ---
 expander_title_parts = []
