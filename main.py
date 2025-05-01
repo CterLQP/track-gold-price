@@ -17,10 +17,10 @@ GOLD_TICKER = 'GC=F'
 FOREX_TICKER = 'VND=X'
 OUNCE_TO_CAY_FACTOR = 1.20565303
 LOGO_URL_SIDEBAR = "https://res.cloudinary.com/dd7gti2kn/image/upload/v1745678186/samples/people/LOGO_LQP_msfted.png"
-SJC_FETCH_INTERVAL_DAYS = 10 # Increased fetch interval for SJC
+SJC_FETCH_INTERVAL_DAYS = 10 # Keep fetch interval for SJC at 10 days
 SJC_FETCH_DELAY_SECONDS = 2 # Delay between SJC API calls
 SJC_TARGET_BRANCH = 'Hồ Chí Minh' # Branch to filter SJC prices for consistency
-CACHE_TTL_SECONDS = 10800 # Cache data for 3 hours (3 * 60 * 60)
+CACHE_TTL_SECONDS = 21600 # Cache data for 6 hours (6 * 60 * 60)
 
 # --- Set Page Config FIRST ---
 st.set_page_config(
@@ -54,7 +54,7 @@ st.markdown("""
 
 
 # --- Data Fetching Function (World Gold & Forex) ---
-@st.cache_data(ttl=CACHE_TTL_SECONDS)
+@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
 def fetch_world_historical_data(start_date, end_date):
     """Fetches world gold and forex data. Returns (data, error_type)"""
     try:
@@ -63,19 +63,19 @@ def fetch_world_historical_data(start_date, end_date):
         time.sleep(0.5)
         forex_data = yf.download(FOREX_TICKER, start=start_date, end=end_date + timedelta(days=1), progress=False)
         if gold_data.empty or forex_data.empty:
-            return (None, None), "nodata" # Indicate no data found
-        return (gold_data, forex_data), None # Success
+            return (None, None), "nodata"
+        return (gold_data, forex_data), None
     except Exception as e:
         error_str = str(e).lower()
         if 'ratelimit' in error_str or 'too many requests' in error_str:
              print(f"Yahoo Finance Rate Limit Error (World Data): {e}")
-             return (None, None), "ratelimit" # Indicate rate limit error
+             return (None, None), "ratelimit"
         else:
              print(f"Error fetching world data: {e}")
-             return (None, None), "other" # Indicate other error
+             return (None, None), "other"
 
 # --- Data Fetching Function (SJC Historical via vnstock) ---
-@st.cache_data(ttl=CACHE_TTL_SECONDS)
+@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
 def fetch_sjc_historical_data(start_date, end_date):
     """
     Fetches historical SJC gold prices. Returns (dataframe, error_type)
@@ -101,8 +101,6 @@ def fetch_sjc_historical_data(start_date, end_date):
             if 'ratelimit' in error_str or 'too many requests' in error_str:
                  print(f"Rate Limit Error (SJC Data) on {date_str}: {e}")
                  rate_limit_encountered = True
-                 # Optionally break here if one rate limit means likely more
-                 # break
             else:
                  print(f"Error fetching SJC on {date_str}: {e}")
                  other_error_encountered = True
@@ -112,11 +110,11 @@ def fetch_sjc_historical_data(start_date, end_date):
 
     if not all_sjc_prices and (rate_limit_encountered or other_error_encountered):
         error_type = "ratelimit" if rate_limit_encountered else "other"
-        return pd.DataFrame(), error_type # Return empty df and error type
+        return pd.DataFrame(), error_type
     elif not all_sjc_prices:
-         return pd.DataFrame(), "nodata" # No data found, no specific error
+         return pd.DataFrame(), "nodata"
     else:
-         return pd.DataFrame(all_sjc_prices), None # Success
+         return pd.DataFrame(all_sjc_prices), None
 
 
 # --- Calculation Function (World Gold VND) ---
@@ -191,54 +189,59 @@ spread_chart_data = pd.DataFrame()
 
 # --- Fetch World Data ---
 world_fetch_error_type = None
+fetch_world_success = False
 with st.spinner(f"Đang tải dữ liệu giá TG..."):
     (gold_hist, forex_hist), world_fetch_error_type = fetch_world_historical_data(start_date, end_date)
     if world_fetch_error_type:
         world_data_error = True
-    elif gold_hist is None or forex_hist is None: # Should not happen if error_type is None, but safety check
+    elif gold_hist is None or forex_hist is None:
          world_data_error = True
     else:
         world_gold_vnd_hist = calculate_world_gold_vnd(gold_hist, forex_hist)
         if world_gold_vnd_hist.empty:
-            world_data_error = True # Treat calculation failure as error for display
+            world_data_error = True
+        else:
+            fetch_world_success = True
 
 # Display world data status message outside spinner
 if world_fetch_error_type == "ratelimit":
-     st.warning("⚠️ Máy chủ Yahoo Finance đang tạm thời giới hạn truy cập (Rate Limit) cho dữ liệu giá thế giới. Vui lòng thử lại sau ít phút.", icon="⏳")
+     st.warning("⚠️ **Giới hạn truy cập (Giá TG):** Máy chủ Yahoo Finance đang tạm thời giới hạn truy cập. Dữ liệu giá thế giới có thể không hiển thị. Vui lòng thử lại sau ít phút.", icon="⏳")
 elif world_fetch_error_type == "nodata":
      st.info("ℹ️ Không tìm thấy dữ liệu giá thế giới cho khoảng thời gian này.")
 elif world_fetch_error_type == "other":
      st.error("❌ Đã xảy ra lỗi khi tải dữ liệu giá thế giới.")
-elif not world_data_error:
-     st.toast("Tải dữ liệu giá thế giới thành công!", icon="✅")
+# elif fetch_world_success: # Toast can be annoying if it appears too often
+#      st.toast("Tải dữ liệu giá thế giới thành công!", icon="✅")
 
 
 # --- Fetch SJC Data ---
 sjc_fetch_error_type = None
+fetch_sjc_success = False
 with st.spinner(f"Đang tải dữ liệu giá SJC (có thể mất vài phút)..."):
      sjc_hist, sjc_fetch_error_type = fetch_sjc_historical_data(start_date, end_date)
      if sjc_fetch_error_type:
          sjc_data_error = True
      elif sjc_hist.empty:
-         sjc_data_error = True # Treat no data found as an error for display consistency
-         if sjc_fetch_error_type is None: # If fetch didn't report error, it means no data available
+         sjc_data_error = True
+         if sjc_fetch_error_type is None:
              sjc_fetch_error_type = "nodata"
      else:
          sjc_hist['Timestamp'] = pd.to_datetime(sjc_hist['Timestamp'])
+         fetch_sjc_success = True
 
 # Display SJC status message outside spinner
 if sjc_fetch_error_type == "ratelimit":
-     st.warning(f"⚠️ Có thể đã gặp giới hạn truy cập khi lấy dữ liệu SJC. Dữ liệu có thể không đầy đủ. Vui lòng thử lại sau.", icon="⏳")
+     st.warning(f"⚠️ **Giới hạn truy cập (Giá SJC):** Có thể đã gặp giới hạn khi lấy dữ liệu SJC. Dữ liệu SJC có thể không đầy đủ hoặc không hiển thị. Vui lòng thử lại sau.", icon="⏳")
 elif sjc_fetch_error_type == "nodata":
      st.info(f"ℹ️ Không tìm thấy dữ liệu SJC nào cho khoảng thời gian này (dữ liệu được kiểm tra mỗi {SJC_FETCH_INTERVAL_DAYS} ngày).")
 elif sjc_fetch_error_type == "other":
      st.error("❌ Đã xảy ra lỗi khi tải dữ liệu SJC.")
-elif not sjc_data_error:
-     st.toast("Tải dữ liệu SJC thành công!", icon="✅")
+# elif fetch_sjc_success:
+#      st.toast("Tải dữ liệu SJC thành công!", icon="✅")
 
 
 # --- Display Metrics ---
-# (Metric display logic remains the same, relying on world_data_error and sjc_data_error flags)
+# (Metric display logic remains the same)
 col1, col2, col3 = st.columns(3)
 def format_delta(delta_value):
     if delta_value is None or pd.isna(delta_value): return None
@@ -273,46 +276,56 @@ st.divider()
 
 # --- Display World Gold Chart ---
 st.subheader("🌍 Giá Vàng Thế Giới (Quy đổi VND/cây)")
-if world_data_error: st.info("Không có dữ liệu giá vàng thế giới để hiển thị.") # Use info instead of warning if error already shown
-else:
+if world_data_error and world_fetch_error_type != "ratelimit": # Only show info if not already showing rate limit warning
+    st.info("Không có dữ liệu giá vàng thế giới để hiển thị.")
+elif not world_data_error: # Plot if no error
     fig_world = px.line(world_gold_vnd_hist, x='Timestamp', y='Giá TG Quy Đổi (VND/cây)', labels={'Timestamp': 'Thời gian', 'Giá TG Quy Đổi (VND/cây)': 'Giá (VND/cây)'})
     fig_world.update_traces(line_color='#1f77b4', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Giá TG: %{y:,.0f}<extra></extra>")
     fig_world.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
     st.plotly_chart(fig_world, use_container_width=True)
+# If world_data_error is True due to rate limit, the warning is already shown above
 
 # --- Display SJC Chart ---
 st.subheader("🇻🇳 Giá Vàng SJC (VND/cây)")
-if sjc_data_error: st.info(f"Không có dữ liệu SJC để hiển thị.") # Use info
-else:
+if sjc_data_error and sjc_fetch_error_type != "ratelimit": # Only show info if not already showing rate limit warning
+    st.info(f"Không có dữ liệu SJC để hiển thị.")
+elif not sjc_data_error: # Plot if no error
     fig_sjc = px.line(sjc_hist, x='Timestamp', y='Giá SJC (VND/cây)', labels={'Timestamp': 'Thời gian', 'Giá SJC (VND/cây)': 'Giá (VND/cây)'}, markers=True)
     fig_sjc.update_traces(line_color='#ff7f0e', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Giá SJC: %{y:,.0f}<extra></extra>")
     fig_sjc.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
     st.plotly_chart(fig_sjc, use_container_width=True)
+# If sjc_data_error is True due to rate limit, the warning is already shown above
 
 # --- Calculate and Display Spread Chart using Forward Fill ---
 st.subheader("⚖️ Chênh lệch Giá (SJC - Thế Giới Quy Đổi)")
 spread_chart_data = pd.DataFrame()
 spread_calculation_possible = False
-if not world_data_error and not sjc_data_error:
+# Only attempt calculation if both fetches were potentially successful (even if calculation failed later)
+if not world_fetch_error_type and not sjc_fetch_error_type:
     if not world_gold_vnd_hist.empty and not sjc_hist.empty:
         spread_calculation_possible = True
-        date_range = pd.date_range(start=min(world_gold_vnd_hist['Timestamp'].min(), sjc_hist['Timestamp'].min()),
-                                   end=max(world_gold_vnd_hist['Timestamp'].max(), sjc_hist['Timestamp'].max()), freq='D')
-        spread_chart_data = pd.DataFrame(index=date_range)
-        spread_chart_data.index.name = 'Timestamp'
-        spread_chart_data = pd.merge(spread_chart_data, world_gold_vnd_hist.set_index('Timestamp'), left_index=True, right_index=True, how='left')
-        sjc_indexed = sjc_hist.set_index('Timestamp')
-        spread_chart_data = pd.merge(spread_chart_data, sjc_indexed, left_index=True, right_index=True, how='left')
-        spread_chart_data['Giá SJC (VND/cây)'].ffill(inplace=True)
-        spread_chart_data.dropna(subset=['Giá TG Quy Đổi (VND/cây)', 'Giá SJC (VND/cây)'], inplace=True)
-        if not spread_chart_data.empty:
-            spread_chart_data['Chênh lệch (SJC - TG)'] = spread_chart_data['Giá SJC (VND/cây)'] - spread_chart_data['Giá TG Quy Đổi (VND/cây)']
-            spread_chart_data.reset_index(inplace=True)
-        else:
-             spread_calculation_possible = False # Mark as not possible if empty after processing
+        try: # Add try-except for robustness during merge/ffill/calculation
+            date_range = pd.date_range(start=min(world_gold_vnd_hist['Timestamp'].min(), sjc_hist['Timestamp'].min()),
+                                       end=max(world_gold_vnd_hist['Timestamp'].max(), sjc_hist['Timestamp'].max()), freq='D')
+            spread_chart_data = pd.DataFrame(index=date_range)
+            spread_chart_data.index.name = 'Timestamp'
+            spread_chart_data = pd.merge(spread_chart_data, world_gold_vnd_hist.set_index('Timestamp'), left_index=True, right_index=True, how='left')
+            sjc_indexed = sjc_hist.set_index('Timestamp')
+            spread_chart_data = pd.merge(spread_chart_data, sjc_indexed, left_index=True, right_index=True, how='left')
+            spread_chart_data['Giá SJC (VND/cây)'].ffill(inplace=True)
+            spread_chart_data.dropna(subset=['Giá TG Quy Đổi (VND/cây)', 'Giá SJC (VND/cây)'], inplace=True)
+            if not spread_chart_data.empty:
+                spread_chart_data['Chênh lệch (SJC - TG)'] = spread_chart_data['Giá SJC (VND/cây)'] - spread_chart_data['Giá TG Quy Đổi (VND/cây)']
+                spread_chart_data.reset_index(inplace=True)
+            else:
+                 spread_calculation_possible = False
+        except Exception as e:
+            print(f"Error calculating spread chart data: {e}")
+            spread_calculation_possible = False
+            spread_chart_data = pd.DataFrame() # Ensure it's empty on error
 
 if not spread_calculation_possible or spread_chart_data.empty or 'Chênh lệch (SJC - TG)' not in spread_chart_data.columns:
-    st.info("Không thể tính hoặc vẽ biểu đồ chênh lệch (thiếu dữ liệu TG hoặc SJC).")
+    st.info("Không thể tính hoặc vẽ biểu đồ chênh lệch (thiếu dữ liệu trùng khớp TG hoặc SJC).")
 else:
     fig_spread = px.line(spread_chart_data, x='Timestamp', y='Chênh lệch (SJC - TG)', labels={'Timestamp': 'Thời gian', 'Chênh lệch (SJC - TG)': 'Chênh lệch (VND/cây)'})
     fig_spread.update_traces(line_color='#2ca02c', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Chênh lệch: %{y:,.0f}<extra></extra>")
