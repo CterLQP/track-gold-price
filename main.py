@@ -1,150 +1,196 @@
-# Lưu file này với tên .py, ví dụ: gold_chart_app.py
 import streamlit as st
 import pandas as pd
-import sqlite3
-from datetime import datetime, timedelta
-import os # Thêm thư viện os để kiểm tra file
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+import time
 
-# --- Kết nối và tải dữ liệu từ Database ---
-# Lấy đường dẫn tuyệt đối đến thư mục chứa script Streamlit
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-# Tạo đường dẫn tuyệt đối đến file database
-DB_FILE = os.path.join(APP_DIR, 'gold_prices.db')
+# --- Các hàm lấy dữ liệu từ code gốc (loại bỏ phần không cần thiết) ---
 
-# Sử dụng cache của Streamlit để tránh đọc DB liên tục mỗi khi có tương tác
-# ttl (time-to-live): Dữ liệu sẽ được cache trong 60 giây trước khi đọc lại từ DB
-# allow_output_mutation=True: Cần thiết khi trả về đối tượng có thể thay đổi như DataFrame
-@st.cache_data(ttl=60)
-def load_data_from_db(limit=None):
-    """Tải dữ liệu giá vàng từ SQLite database."""
-    # Kiểm tra xem file DB có tồn tại không
-    if not os.path.exists(DB_FILE):
-        st.error(f"Lỗi: Không tìm thấy file database '{DB_FILE}'. Hãy đảm bảo script thu thập dữ liệu đang chạy và tạo file này.")
-        return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)']) # Trả về DataFrame rỗng
+# @st.cache_data(ttl=60) # Cân nhắc cache để tránh request liên tục nếu web có giới hạn
+def fetch_web_data():
+    """Tải nội dung HTML từ trang web Trading Economics."""
+    url = "https://tradingeconomics.com/commodities"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10) # Thêm timeout
+        response.raise_for_status() # Kiểm tra lỗi HTTP (4xx, 5xx)
+        return response.content
+    except requests.exceptions.RequestException as e:
+        st.error(f"Lỗi mạng hoặc HTTP khi tải dữ liệu: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Lỗi không xác định khi tải dữ liệu web: {e}")
+        return None
+
+def clean_major_name(major):
+    """Làm sạch tên hàng hóa để so sánh chính xác."""
+    return major.split("\n\n")[0].strip() if "\n\n" in major else major.strip()
+
+def format_value(value):
+    """Định dạng giá trị để luôn có 2 chữ số sau dấu thập phân."""
+    try:
+        # Thử chuyển đổi trực tiếp sang float trước
+        f_value = float(value)
+        return f"{f_value:.2f}"
+    except ValueError:
+         # Nếu không được, xử lý như chuỗi (code gốc)
+        if "." in value:
+            integer_part, decimal_part = value.split(".", 1)
+            # Đảm bảo decimal_part chỉ chứa số và giới hạn độ dài nếu cần
+            decimal_part = ''.join(filter(str.isdigit, decimal_part))[:2]
+            return f"{integer_part}.{decimal_part.ljust(2, '0')}" # Dùng ljust để đảm bảo 2 chữ số
+        elif value.isdigit():
+             return f"{value}.00"
+        else:
+            # Trường hợp không thể định dạng, trả về giá trị gốc hoặc None/Error
+            st.warning(f"Không thể định dạng giá trị: {value}")
+            return value # Hoặc return None
+
+# @st.cache_data(ttl=60) # Cache hàm này nếu muốn giảm tần suất request
+def get_world_gold_price():
+    """Trích xuất giá vàng thế giới từ Trading Economics (USD/ounce)."""
+    html_content = fetch_web_data()
+    if not html_content:
+        # st.error("Lỗi: Không thể tải dữ liệu từ Trading Economics.") # Đã báo lỗi trong fetch_web_data
+        return None
 
     try:
-        # Sử dụng check_same_thread=False vì Streamlit chạy trong môi trường đa luồng
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        # Chọn cột timestamp và world_gold_price (đã là VND/cây)
-        query = "SELECT timestamp, world_gold_price FROM gold_prices ORDER BY timestamp ASC"
+        soup = BeautifulSoup(html_content, 'html.parser')
+        # Tìm bảng dựa vào id hoặc class cụ thể hơn nếu có thể
+        # Ví dụ: table = soup.find('table', {'id': 'some-specific-id'})
+        # Hoặc dựa vào cấu trúc gần đó
+        tables = soup.find_all('table', {'class': 'table table-hover table-striped table-heatmap'})
 
-        # Nếu người dùng chọn giới hạn số điểm dữ liệu
-        if limit and isinstance(limit, int) and limit > 0:
-             # Lấy N bản ghi mới nhất theo timestamp, sau đó sắp xếp lại tăng dần cho biểu đồ
-             query = f"SELECT timestamp, world_gold_price FROM (SELECT * FROM gold_prices ORDER BY timestamp DESC LIMIT {limit}) ORDER BY timestamp ASC"
+        if not tables:
+             # Thử tìm tất cả các bảng nếu class không khớp
+             tables = soup.find_all('table')
+             if len(tables) < 2: # Vẫn giữ logic cũ nếu tìm theo class thất bại
+                 st.error("Lỗi: Không tìm thấy bảng dữ liệu phù hợp trên Trading Economics.")
+                 return None
+             # Giả sử bảng thứ 2 là bảng cần thiết nếu tìm theo class thất bại
+             target_table = tables[1]
+        else:
+             target_table = tables[0] # Thường bảng đầu tiên nếu tìm theo class thành công
 
-        df = pd.read_sql_query(query, conn)
-        conn.close()
 
-        # Kiểm tra nếu df rỗng sau khi query
-        if df.empty:
-            st.warning(f"Không có dữ liệu nào trong bảng 'gold_prices' của file '{DB_FILE}'.")
-            return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)'])
+        rows = target_table.find_all('tr')
+        if not rows or len(rows) < 2:
+             st.error("Lỗi: Bảng dữ liệu tìm thấy không có hàng dữ liệu (chỉ có header?).")
+             return None
 
-        # Chuyển đổi cột timestamp sang kiểu datetime
-        # errors='coerce' sẽ chuyển các giá trị không hợp lệ thành NaT (Not a Time)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        # Bỏ qua hàng tiêu đề (thường là hàng đầu tiên)
+        data_rows = rows[1:]
 
-        # Loại bỏ các hàng có timestamp không hợp lệ (NaT)
-        df.dropna(subset=['timestamp'], inplace=True)
+        for row in data_rows:
+            # Lấy tất cả cột td và th trong hàng
+            cols = row.find_all(['td', 'th'], recursive=False) # recursive=False để tránh lấy thẻ lồng nhau không mong muốn
+            if len(cols) > 1: # Cần ít nhất 2 cột (tên và giá)
+                commodity_name_element = cols[0].find('b') # Thường tên nằm trong thẻ <b>
+                if commodity_name_element:
+                    commodity_name = clean_major_name(commodity_name_element.text)
+                    if commodity_name == "Gold":
+                        price_str = cols[1].text.strip()
+                        formatted_price_str = format_value(price_str)
+                        try:
+                            price_float = float(formatted_price_str)
+                            return price_float
+                        except (ValueError, TypeError) as e:
+                            st.error(f"Lỗi: Không thể chuyển đổi giá vàng '{formatted_price_str}' sang số. Lỗi: {e}")
+                            return None
+                # else: # Log nếu không tìm thấy thẻ <b> nếu cần debug
+                #     st.warning(f"Không tìm thấy thẻ 'b' trong cột đầu tiên của hàng: {row}")
 
-        # Kiểm tra lại nếu df rỗng sau khi loại bỏ NaT
-        if df.empty:
-            st.warning("Dữ liệu timestamp không hợp lệ, không thể vẽ biểu đồ.")
-            return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)'])
 
-        # Đặt timestamp làm index (cần cho st.line_chart)
-        df.set_index('timestamp', inplace=True)
-
-        # Đổi tên cột để dễ hiểu hơn trên biểu đồ
-        # Lưu ý: Cột 'world_gold_price' trong DB thực chất là giá VND/cây theo code gốc
-        df.rename(columns={'world_gold_price': 'Giá Vàng TG (VND/cây)'}, inplace=True)
-
-        return df
-
-    except sqlite3.Error as e:
-        st.error(f"Lỗi kết nối hoặc truy vấn database SQLite: {e}")
-        return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)']) # Trả về DataFrame rỗng
+        st.error("Lỗi: Không tìm thấy 'Gold' trong bảng dữ liệu đã xác định.")
+        return None
     except Exception as e:
-        st.error(f"Lỗi không xác định khi tải dữ liệu: {e}")
-        return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)']) # Trả về DataFrame rỗng
+        st.error(f"Lỗi khi xử lý HTML (BeautifulSoup): {e}")
+        return None
+
+# --- Khởi tạo Session State ---
+if 'gold_data_session' not in st.session_state:
+    st.session_state.gold_data_session = pd.DataFrame(columns=['timestamp', 'Giá (USD/ounce)'])
+    st.session_state.gold_data_session.set_index('timestamp', inplace=True)
+
 
 # --- Giao diện Streamlit ---
-st.set_page_config(page_title="Biểu đồ Giá Vàng Thế Giới", layout="wide")
+st.set_page_config(page_title="Biểu đồ Giá Vàng Thế Giới (Live)", layout="wide")
+st.title("📉 Biểu đồ Xu hướng Giá Vàng Thế Giới (USD/ounce)")
+st.caption("Biểu đồ hiển thị dữ liệu được cập nhật trong phiên làm việc hiện tại.")
+st.info("Giá được lấy trực tiếp từ Trading Economics. Biểu đồ sẽ tự xây dựng khi bạn nhấn nút 'Cập nhật'.")
 
-st.title("📈 Biểu đồ Xu hướng Giá Vàng Thế Giới (VND/cây)")
-st.caption(f"Dữ liệu được làm mới tự động mỗi phút. Lần tải trang: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# --- Nút cập nhật và Logic ---
+col1, col2 = st.columns([1, 5]) # Chia cột để nút nhỏ hơn
 
-# --- Lựa chọn số lượng điểm dữ liệu ---
-st.sidebar.header("Tùy chọn hiển thị")
-num_points_options = [50, 100, 200, 500, 1000, 'Tất cả']
-num_points = st.sidebar.select_slider(
-    "Số lượng điểm dữ liệu mới nhất:",
-    options=num_points_options,
-    value=200 # Giá trị mặc định
-)
+with col1:
+    if st.button("🔄 Cập nhật giá"):
+        with st.spinner("Đang lấy giá vàng mới nhất..."):
+            current_price = get_world_gold_price()
+            current_time = pd.to_datetime(datetime.now())
 
-# --- Tải dữ liệu dựa trên lựa chọn ---
-limit_query = None
-if isinstance(num_points, int):
-    limit_query = num_points
+            if current_price is not None:
+                # Tạo DataFrame mới cho điểm dữ liệu hiện tại
+                new_data = pd.DataFrame({'Giá (USD/ounce)': [current_price]}, index=[current_time])
+                new_data.index.name = 'timestamp'
 
-df_gold = load_data_from_db(limit=limit_query)
+                # Nối DataFrame mới vào DataFrame trong session_state
+                st.session_state.gold_data_session = pd.concat([st.session_state.gold_data_session, new_data])
+
+                # Giữ lại N điểm dữ liệu cuối cùng (ví dụ: 1000 điểm) để tránh quá tải bộ nhớ
+                max_points = 1000
+                if len(st.session_state.gold_data_session) > max_points:
+                    st.session_state.gold_data_session = st.session_state.gold_data_session.tail(max_points)
+
+                st.success(f"Đã cập nhật giá: ${current_price:.2f}")
+            else:
+                st.error("Không thể lấy được giá vàng lần này.")
 
 # --- Hiển thị biểu đồ và thông tin ---
-if not df_gold.empty:
-    st.subheader(f"Biểu đồ đường ({'Tất cả' if limit_query is None else str(limit_query) + ' điểm mới nhất'})")
-
-    # Vẽ biểu đồ đường
-    # Cung cấp tên cột cụ thể để vẽ
-    st.line_chart(df_gold[['Giá Vàng TG (VND/cây)']])
+if not st.session_state.gold_data_session.empty:
+    st.subheader("Biểu đồ đường:")
+    # Vẽ biểu đồ
+    st.line_chart(st.session_state.gold_data_session[['Giá (USD/ounce)']])
 
     # Hiển thị giá mới nhất
-    try:
-        latest_timestamp = df_gold.index[-1]
-        latest_price = df_gold['Giá Vàng TG (VND/cây)'].iloc[-1]
+    latest_timestamp = st.session_state.gold_data_session.index[-1]
+    latest_price = st.session_state.gold_data_session['Giá (USD/ounce)'].iloc[-1]
 
-        # Tính toán thay đổi so với điểm trước đó (nếu có đủ dữ liệu)
-        delta = None
-        delta_color = "normal"
-        if len(df_gold) > 1:
-            previous_price = df_gold['Giá Vàng TG (VND/cây)'].iloc[-2]
-            delta_value = latest_price - previous_price
-            delta = f"{delta_value:,.2f} VND"
-            if delta_value > 0:
-                delta_color = "normal" # Mặc định Streamlit là xanh lá
-            elif delta_value < 0:
-                delta_color = "inverse" # Mặc định Streamlit là đỏ
+    # Tính toán thay đổi so với điểm trước đó (nếu có)
+    delta = None
+    delta_color = "normal"
+    if len(st.session_state.gold_data_session) > 1:
+        previous_price = st.session_state.gold_data_session['Giá (USD/ounce)'].iloc[-2]
+        delta_value = latest_price - previous_price
+        delta = f"{delta_value:+.2f} USD" # Thêm dấu + cho giá trị dương
+        if delta_value > 0:
+            delta_color = "normal"
+        elif delta_value < 0:
+            delta_color = "inverse"
 
-        st.subheader("Giá trị mới nhất:")
-        st.metric(label="Giá Vàng TG (VND/cây)",
-                  value=f"{latest_price:,.2f} VND",
-                  delta=delta,
-                  delta_color=delta_color)
-        st.caption(f"Thời điểm ghi nhận: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    except IndexError:
-        st.info("Chưa đủ dữ liệu để hiển thị giá trị mới nhất.")
-    except Exception as e:
-         st.error(f"Lỗi khi hiển thị giá trị mới nhất: {e}")
-
+    st.metric(label="Giá USD/ounce mới nhất",
+              value=f"${latest_price:,.2f}",
+              delta=delta,
+              delta_color=delta_color)
+    st.caption(f"Thời điểm cập nhật cuối: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Tùy chọn: Hiển thị bảng dữ liệu
-    if st.checkbox("Hiển thị dữ liệu dạng bảng"):
-        st.subheader("Dữ liệu chi tiết:")
-        # Tạo bản sao để định dạng hiển thị, giữ nguyên kiểu số trong df_gold
-        df_display = df_gold.copy()
-        # Định dạng lại cột giá trị để dễ đọc hơn trong bảng
-        df_display['Giá Vàng TG (VND/cây)'] = df_display['Giá Vàng TG (VND/cây)'].map('{:,.2f}'.format)
-        st.dataframe(df_display.sort_index(ascending=False)) # Sắp xếp mới nhất lên đầu
+    if st.checkbox("Hiển thị dữ liệu phiên hiện tại"):
+        st.dataframe(st.session_state.gold_data_session.sort_index(ascending=False), use_container_width=True)
 else:
-    # Thông báo lỗi/cảnh báo đã được hiển thị trong hàm load_data_from_db
-    st.info("Chưa có dữ liệu để vẽ biểu đồ. Hãy đảm bảo script gốc đang chạy và lưu dữ liệu.")
+    st.info("Nhấn nút 'Cập nhật giá' để bắt đầu thu thập dữ liệu và vẽ biểu đồ.")
 
-# Thêm nút làm mới thủ công vào sidebar
-if st.sidebar.button("Làm mới dữ liệu ngay"):
-    # Xóa cache và chạy lại để lấy dữ liệu mới nhất
-    st.cache_data.clear()
-    st.rerun()
+# Thêm khoảng trống cuối trang
+st.write("")
+st.write("")
 
-st.sidebar.info("Lưu ý: Script thu thập dữ liệu gốc (code bạn cung cấp) cần chạy để cập nhật file `gold_prices.db`.")
+# --- Cân nhắc Auto-refresh (Nâng cao) ---
+# Để tự động cập nhật, bạn cần cài đặt: pip install streamlit-autorefresh
+# Rồi thêm vào cuối code:
+# from streamlit_autorefresh import st_autorefresh
+# # Cập nhật mỗi 60 giây
+# count = st_autorefresh(interval=60 * 1000, key="goldautorefresh")
+# st.caption(f"Tự động làm mới sau mỗi 60 giây. Lượt làm mới: {count}")
+# Lưu ý: Tự động cập nhật sẽ liên tục request đến web, hãy cân nhắc tần suất phù hợp.
