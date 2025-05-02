@@ -1,196 +1,148 @@
 import streamlit as st
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
-import time
+import yfinance as yf
+from datetime import datetime, timedelta
 
-# --- Các hàm lấy dữ liệu từ code gốc (loại bỏ phần không cần thiết) ---
+# --- Hàm tải dữ liệu từ Yahoo Finance ---
 
-# @st.cache_data(ttl=60) # Cân nhắc cache để tránh request liên tục nếu web có giới hạn
-def fetch_web_data():
-    """Tải nội dung HTML từ trang web Trading Economics."""
-    url = "https://tradingeconomics.com/commodities"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-    }
+# Cache dữ liệu để tránh tải lại liên tục khi thay đổi widget không liên quan đến ngày tháng
+# ttl=timedelta(hours=1): Cache dữ liệu trong 1 giờ
+@st.cache_data(ttl=timedelta(hours=1))
+def load_gold_data(ticker, start_date, end_date):
+    """
+    Tải dữ liệu lịch sử cho một mã ticker từ Yahoo Finance.
+    ticker: Mã chứng khoán (ví dụ: 'GC=F' cho Gold Futures)
+    start_date: Ngày bắt đầu (kiểu date hoặc datetime)
+    end_date: Ngày kết thúc (kiểu date hoặc datetime)
+    """
     try:
-        response = requests.get(url, headers=headers, timeout=10) # Thêm timeout
-        response.raise_for_status() # Kiểm tra lỗi HTTP (4xx, 5xx)
-        return response.content
-    except requests.exceptions.RequestException as e:
-        st.error(f"Lỗi mạng hoặc HTTP khi tải dữ liệu: {e}")
-        return None
+        # yfinance thường không bao gồm end_date, nên cần +1 ngày
+        # Chuyển đổi date thành datetime nếu cần để cộng timedelta
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.min.time()) + timedelta(days=1)
+
+        # Tải dữ liệu
+        data = yf.download(ticker, start=start_dt, end=end_dt, progress=False) # Tắt progress bar
+
+        if data.empty:
+            st.warning(f"Không tìm thấy dữ liệu cho mã {ticker} trong khoảng thời gian đã chọn.")
+            return None
+        # Đổi tên cột cho thân thiện hơn
+        data.rename(columns={
+            'Open': 'Mở cửa',
+            'High': 'Cao nhất',
+            'Low': 'Thấp nhất',
+            'Close': 'Đóng cửa',
+            'Adj Close': 'Đóng cửa điều chỉnh',
+            'Volume': 'Khối lượng'
+            }, inplace=True)
+        return data
     except Exception as e:
-        st.error(f"Lỗi không xác định khi tải dữ liệu web: {e}")
+        st.error(f"Lỗi khi tải dữ liệu từ yfinance: {e}")
         return None
 
-def clean_major_name(major):
-    """Làm sạch tên hàng hóa để so sánh chính xác."""
-    return major.split("\n\n")[0].strip() if "\n\n" in major else major.strip()
+# --- Thiết lập giao diện Streamlit ---
+st.set_page_config(page_title="Biểu đồ Lịch sử Giá Vàng", layout="wide")
+st.title("📈 Biểu đồ Lịch sử Giá Vàng (USD/ounce)")
+st.caption("Dữ liệu được lấy từ Yahoo Finance.")
 
-def format_value(value):
-    """Định dạng giá trị để luôn có 2 chữ số sau dấu thập phân."""
-    try:
-        # Thử chuyển đổi trực tiếp sang float trước
-        f_value = float(value)
-        return f"{f_value:.2f}"
-    except ValueError:
-         # Nếu không được, xử lý như chuỗi (code gốc)
-        if "." in value:
-            integer_part, decimal_part = value.split(".", 1)
-            # Đảm bảo decimal_part chỉ chứa số và giới hạn độ dài nếu cần
-            decimal_part = ''.join(filter(str.isdigit, decimal_part))[:2]
-            return f"{integer_part}.{decimal_part.ljust(2, '0')}" # Dùng ljust để đảm bảo 2 chữ số
-        elif value.isdigit():
-             return f"{value}.00"
-        else:
-            # Trường hợp không thể định dạng, trả về giá trị gốc hoặc None/Error
-            st.warning(f"Không thể định dạng giá trị: {value}")
-            return value # Hoặc return None
-
-# @st.cache_data(ttl=60) # Cache hàm này nếu muốn giảm tần suất request
-def get_world_gold_price():
-    """Trích xuất giá vàng thế giới từ Trading Economics (USD/ounce)."""
-    html_content = fetch_web_data()
-    if not html_content:
-        # st.error("Lỗi: Không thể tải dữ liệu từ Trading Economics.") # Đã báo lỗi trong fetch_web_data
-        return None
-
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        # Tìm bảng dựa vào id hoặc class cụ thể hơn nếu có thể
-        # Ví dụ: table = soup.find('table', {'id': 'some-specific-id'})
-        # Hoặc dựa vào cấu trúc gần đó
-        tables = soup.find_all('table', {'class': 'table table-hover table-striped table-heatmap'})
-
-        if not tables:
-             # Thử tìm tất cả các bảng nếu class không khớp
-             tables = soup.find_all('table')
-             if len(tables) < 2: # Vẫn giữ logic cũ nếu tìm theo class thất bại
-                 st.error("Lỗi: Không tìm thấy bảng dữ liệu phù hợp trên Trading Economics.")
-                 return None
-             # Giả sử bảng thứ 2 là bảng cần thiết nếu tìm theo class thất bại
-             target_table = tables[1]
-        else:
-             target_table = tables[0] # Thường bảng đầu tiên nếu tìm theo class thành công
+# --- Chọn Ticker ---
+# Có thể thêm các lựa chọn khác như 'GLD' (ETF) nếu muốn
+ticker_choice = st.selectbox(
+    "Chọn loại dữ liệu vàng:",
+    options=['GC=F', 'GLD'],
+    format_func=lambda x: f"{x} (Gold Futures)" if x == 'GC=F' else f"{x} (SPDR Gold Shares ETF)"
+)
+st.write(f"Đang sử dụng mã: **{ticker_choice}**")
 
 
-        rows = target_table.find_all('tr')
-        if not rows or len(rows) < 2:
-             st.error("Lỗi: Bảng dữ liệu tìm thấy không có hàng dữ liệu (chỉ có header?).")
-             return None
+# --- Sidebar cho lựa chọn thời gian ---
+st.sidebar.header("📅 Chọn khoảng thời gian")
 
-        # Bỏ qua hàng tiêu đề (thường là hàng đầu tiên)
-        data_rows = rows[1:]
+# Các khoảng thời gian định sẵn
+predefined_ranges = {
+    "1 Tháng": timedelta(days=30),
+    "3 Tháng": timedelta(days=90),
+    "6 Tháng": timedelta(days=180),
+    "1 Năm": timedelta(days=365),
+    "5 Năm": timedelta(days=365*5),
+    "Từ đầu năm (YTD)": "YTD",
+    "Tất cả": "ALL"
+}
 
-        for row in data_rows:
-            # Lấy tất cả cột td và th trong hàng
-            cols = row.find_all(['td', 'th'], recursive=False) # recursive=False để tránh lấy thẻ lồng nhau không mong muốn
-            if len(cols) > 1: # Cần ít nhất 2 cột (tên và giá)
-                commodity_name_element = cols[0].find('b') # Thường tên nằm trong thẻ <b>
-                if commodity_name_element:
-                    commodity_name = clean_major_name(commodity_name_element.text)
-                    if commodity_name == "Gold":
-                        price_str = cols[1].text.strip()
-                        formatted_price_str = format_value(price_str)
-                        try:
-                            price_float = float(formatted_price_str)
-                            return price_float
-                        except (ValueError, TypeError) as e:
-                            st.error(f"Lỗi: Không thể chuyển đổi giá vàng '{formatted_price_str}' sang số. Lỗi: {e}")
-                            return None
-                # else: # Log nếu không tìm thấy thẻ <b> nếu cần debug
-                #     st.warning(f"Không tìm thấy thẻ 'b' trong cột đầu tiên của hàng: {row}")
+# Sử dụng st.radio để chọn nhanh
+selected_range_key = st.sidebar.radio(
+    "Chọn nhanh:",
+    options=list(predefined_ranges.keys()),
+    index=3 # Mặc định chọn "1 Năm"
+)
 
+# Xác định ngày bắt đầu và kết thúc dựa trên lựa chọn nhanh
+today = datetime.now().date()
+start_date_auto = today - timedelta(days=365) # Mặc định
+end_date_auto = today
 
-        st.error("Lỗi: Không tìm thấy 'Gold' trong bảng dữ liệu đã xác định.")
-        return None
-    except Exception as e:
-        st.error(f"Lỗi khi xử lý HTML (BeautifulSoup): {e}")
-        return None
-
-# --- Khởi tạo Session State ---
-if 'gold_data_session' not in st.session_state:
-    st.session_state.gold_data_session = pd.DataFrame(columns=['timestamp', 'Giá (USD/ounce)'])
-    st.session_state.gold_data_session.set_index('timestamp', inplace=True)
-
-
-# --- Giao diện Streamlit ---
-st.set_page_config(page_title="Biểu đồ Giá Vàng Thế Giới (Live)", layout="wide")
-st.title("📉 Biểu đồ Xu hướng Giá Vàng Thế Giới (USD/ounce)")
-st.caption("Biểu đồ hiển thị dữ liệu được cập nhật trong phiên làm việc hiện tại.")
-st.info("Giá được lấy trực tiếp từ Trading Economics. Biểu đồ sẽ tự xây dựng khi bạn nhấn nút 'Cập nhật'.")
-
-# --- Nút cập nhật và Logic ---
-col1, col2 = st.columns([1, 5]) # Chia cột để nút nhỏ hơn
-
-with col1:
-    if st.button("🔄 Cập nhật giá"):
-        with st.spinner("Đang lấy giá vàng mới nhất..."):
-            current_price = get_world_gold_price()
-            current_time = pd.to_datetime(datetime.now())
-
-            if current_price is not None:
-                # Tạo DataFrame mới cho điểm dữ liệu hiện tại
-                new_data = pd.DataFrame({'Giá (USD/ounce)': [current_price]}, index=[current_time])
-                new_data.index.name = 'timestamp'
-
-                # Nối DataFrame mới vào DataFrame trong session_state
-                st.session_state.gold_data_session = pd.concat([st.session_state.gold_data_session, new_data])
-
-                # Giữ lại N điểm dữ liệu cuối cùng (ví dụ: 1000 điểm) để tránh quá tải bộ nhớ
-                max_points = 1000
-                if len(st.session_state.gold_data_session) > max_points:
-                    st.session_state.gold_data_session = st.session_state.gold_data_session.tail(max_points)
-
-                st.success(f"Đã cập nhật giá: ${current_price:.2f}")
-            else:
-                st.error("Không thể lấy được giá vàng lần này.")
-
-# --- Hiển thị biểu đồ và thông tin ---
-if not st.session_state.gold_data_session.empty:
-    st.subheader("Biểu đồ đường:")
-    # Vẽ biểu đồ
-    st.line_chart(st.session_state.gold_data_session[['Giá (USD/ounce)']])
-
-    # Hiển thị giá mới nhất
-    latest_timestamp = st.session_state.gold_data_session.index[-1]
-    latest_price = st.session_state.gold_data_session['Giá (USD/ounce)'].iloc[-1]
-
-    # Tính toán thay đổi so với điểm trước đó (nếu có)
-    delta = None
-    delta_color = "normal"
-    if len(st.session_state.gold_data_session) > 1:
-        previous_price = st.session_state.gold_data_session['Giá (USD/ounce)'].iloc[-2]
-        delta_value = latest_price - previous_price
-        delta = f"{delta_value:+.2f} USD" # Thêm dấu + cho giá trị dương
-        if delta_value > 0:
-            delta_color = "normal"
-        elif delta_value < 0:
-            delta_color = "inverse"
-
-    st.metric(label="Giá USD/ounce mới nhất",
-              value=f"${latest_price:,.2f}",
-              delta=delta,
-              delta_color=delta_color)
-    st.caption(f"Thời điểm cập nhật cuối: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Tùy chọn: Hiển thị bảng dữ liệu
-    if st.checkbox("Hiển thị dữ liệu phiên hiện tại"):
-        st.dataframe(st.session_state.gold_data_session.sort_index(ascending=False), use_container_width=True)
+if predefined_ranges[selected_range_key] == "YTD":
+    start_date_auto = datetime(today.year, 1, 1).date()
+    end_date_auto = today
+elif predefined_ranges[selected_range_key] == "ALL":
+    # yfinance sẽ tự lấy tất cả nếu start date đủ xa
+    # Đặt ngày bắt đầu rất sớm (ví dụ: 1970) để lấy hết lịch sử có thể
+    start_date_auto = datetime(1970, 1, 1).date()
+    end_date_auto = today
 else:
-    st.info("Nhấn nút 'Cập nhật giá' để bắt đầu thu thập dữ liệu và vẽ biểu đồ.")
+    time_delta = predefined_ranges[selected_range_key]
+    start_date_auto = today - time_delta
+    end_date_auto = today
 
-# Thêm khoảng trống cuối trang
-st.write("")
-st.write("")
+# Cho phép tùy chỉnh ngày bắt đầu và kết thúc
+st.sidebar.markdown("---") # Dòng kẻ ngang phân cách
+start_date = st.sidebar.date_input("Ngày bắt đầu tùy chỉnh", start_date_auto)
+end_date = st.sidebar.date_input("Ngày kết thúc tùy chỉnh", end_date_auto)
 
-# --- Cân nhắc Auto-refresh (Nâng cao) ---
-# Để tự động cập nhật, bạn cần cài đặt: pip install streamlit-autorefresh
-# Rồi thêm vào cuối code:
-# from streamlit_autorefresh import st_autorefresh
-# # Cập nhật mỗi 60 giây
-# count = st_autorefresh(interval=60 * 1000, key="goldautorefresh")
-# st.caption(f"Tự động làm mới sau mỗi 60 giây. Lượt làm mới: {count}")
-# Lưu ý: Tự động cập nhật sẽ liên tục request đến web, hãy cân nhắc tần suất phù hợp.
+# --- Validate ngày tháng ---
+if start_date > end_date:
+    st.error("Lỗi: Ngày kết thúc phải sau ngày bắt đầu.")
+    st.stop() # Dừng thực thi nếu ngày không hợp lệ
+
+# --- Tải và hiển thị dữ liệu ---
+st.subheader(f"Dữ liệu từ {start_date.strftime('%d/%m/%Y')} đến {end_date.strftime('%d/%m/%Y')}")
+
+# Tải dữ liệu dựa trên lựa chọn của người dùng
+gold_data = load_gold_data(ticker_choice, start_date, end_date)
+
+if gold_data is not None and not gold_data.empty:
+    # Chọn cột để vẽ biểu đồ (Thường là 'Đóng cửa')
+    chart_column = 'Đóng cửa'
+    if chart_column not in gold_data.columns:
+        st.error(f"Không tìm thấy cột '{chart_column}' trong dữ liệu trả về.")
+        st.stop()
+
+    # --- Vẽ biểu đồ ---
+    st.line_chart(gold_data[[chart_column]])
+
+    # --- Hiển thị thêm thông tin (tùy chọn) ---
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    try:
+        latest_price = gold_data[chart_column].iloc[-1]
+        price_change = gold_data[chart_column].iloc[-1] - gold_data[chart_column].iloc[-2] if len(gold_data) > 1 else 0
+        percent_change = (price_change / gold_data[chart_column].iloc[-2] * 100) if len(gold_data) > 1 and gold_data[chart_column].iloc[-2] != 0 else 0
+
+        col1.metric(f"Giá {chart_column} cuối cùng", f"${latest_price:,.2f}", f"{price_change:+.2f} ({percent_change:+.2f}%)")
+        col2.metric("Cao nhất (trong khoảng)", f"${gold_data['Cao nhất'].max():,.2f}")
+        col3.metric("Thấp nhất (trong khoảng)", f"${gold_data['Thấp nhất'].min():,.2f}")
+    except IndexError:
+        st.warning("Không đủ dữ liệu để tính toán thông tin tóm tắt.")
+    except Exception as e:
+        st.error(f"Lỗi khi tính toán thông tin tóm tắt: {e}")
+
+
+    # --- Hiển thị bảng dữ liệu (tùy chọn) ---
+    if st.checkbox("Hiển thị dữ liệu chi tiết dạng bảng"):
+        st.dataframe(gold_data.sort_index(ascending=False)) # Sắp xếp mới nhất lên đầu
+else:
+    st.info("Không có dữ liệu để hiển thị. Vui lòng thử lại hoặc chọn khoảng thời gian khác.")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Lưu ý: Dữ liệu tài chính có thể có độ trễ.")
