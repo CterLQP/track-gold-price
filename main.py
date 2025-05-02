@@ -1,361 +1,94 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
-import plotly.express as px
+import sqlite3
 from datetime import datetime, timedelta
-import time # Required for time.sleep
-# Import the specific function if possible, otherwise rely on vnstock being installed
-try:
-    from vnstock.explorer.misc import sjc_gold_price
-except ImportError:
-    st.error("Thư viện 'vnstock' chưa được cài đặt hoặc không tìm thấy hàm 'sjc_gold_price'. Vui lòng cài đặt: pip install vnstock")
-    st.stop()
 
+# --- Kết nối và tải dữ liệu từ Database ---
+DB_FILE = 'gold_prices.db'
 
-# --- Constants ---
-GOLD_TICKER = 'GC=F'
-FOREX_TICKER = 'VND=X'
-OUNCE_TO_CAY_FACTOR = 1.20565303
-LOGO_URL_SIDEBAR = "https://res.cloudinary.com/dd7gti2kn/image/upload/v1745678186/samples/people/LOGO_LQP_msfted.png"
-SJC_FETCH_INTERVAL_DAYS = 10 # Keep fetch interval for SJC at 10 days
-SJC_FETCH_DELAY_SECONDS = 2 # Delay between SJC API calls
-SJC_TARGET_BRANCH = 'Hồ Chí Minh' # Branch to filter SJC prices for consistency
-CACHE_TTL_SECONDS = 21600 # Cache data for 6 hours (6 * 60 * 60)
+# Sử dụng cache của Streamlit để tránh đọc DB liên tục mỗi khi có tương tác
+# ttl (time-to-live): Dữ liệu sẽ được cache trong 60 giây trước khi đọc lại từ DB
+# Điều này giúp app phản hồi nhanh hơn và giảm tải cho DB.
+@st.cache_data(ttl=60)
+def load_data_from_db(limit=None):
+    """Tải dữ liệu giá vàng từ SQLite database."""
+    try:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False) # check_same_thread=False cần thiết cho Streamlit
+        query = "SELECT timestamp, world_gold_price FROM gold_prices ORDER BY timestamp ASC"
+        if limit and isinstance(limit, int) and limit > 0:
+             query = f"SELECT timestamp, world_gold_price FROM (SELECT * FROM gold_prices ORDER BY timestamp DESC LIMIT {limit}) ORDER BY timestamp ASC"
+            # Lấy N bản ghi mới nhất, sau đó sắp xếp lại theo thời gian tăng dần cho biểu đồ
 
-# --- Set Page Config FIRST ---
-st.set_page_config(
-    page_title="Biểu đồ Giá Vàng",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    page_icon="🪙"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+
+        # Chuyển đổi cột timestamp sang kiểu datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        # Đặt timestamp làm index (cần cho st.line_chart)
+        df.set_index('timestamp', inplace=True)
+
+        # Đổi tên cột để dễ hiểu hơn trên biểu đồ
+        df.rename(columns={'world_gold_price': 'Giá Vàng TG (VND/cây)'}, inplace=True)
+
+        return df
+    except sqlite3.Error as e:
+        st.error(f"Lỗi kết nối hoặc truy vấn database: {e}")
+        # Trả về DataFrame rỗng nếu có lỗi
+        return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)'])
+    except Exception as e:
+        st.error(f"Lỗi không xác định khi tải dữ liệu: {e}")
+        # Trả về DataFrame rỗng nếu có lỗi
+        return pd.DataFrame(columns=['Giá Vàng TG (VND/cây)'])
+
+# --- Giao diện Streamlit ---
+st.set_page_config(page_title="Biểu đồ Giá Vàng Thế Giới", layout="wide")
+
+st.title("📈 Biểu đồ Xu hướng Giá Vàng Thế Giới (VND/cây)")
+st.caption(f"Dữ liệu được cập nhật tự động. Lần làm mới cuối: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# --- Lựa chọn số lượng điểm dữ liệu ---
+st.sidebar.header("Tùy chọn hiển thị")
+num_points = st.sidebar.select_slider(
+    "Số lượng điểm dữ liệu mới nhất cần hiển thị:",
+    options=[50, 100, 200, 500, 1000, 'Tất cả'],
+    value=200 # Giá trị mặc định
 )
 
-# --- Custom CSS ---
-# (CSS remains the same as the previous version)
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="st-"] { font-family: 'Inter', sans-serif; }
-    .main .block-container { padding: 1.5rem 2rem; }
-    [data-testid="stSidebar"] { padding-top: 1rem; }
-    .stAlert, [data-testid="stExpander"] { border-radius: 0.5rem; border: 1px solid #eee; }
-    [data-testid="stExpander"] summary { font-weight: 600; }
-    .footer-caption { color: grey; font-size: 0.85em; }
-    .footer-copyright { text-align: right; color: grey; font-size: 0.85em; }
-    [data-testid="stMetric"] { background-color: #FFFFFF; border: 1px solid #e6e6e6; border-radius: 0.5rem; padding: 1rem 1.25rem; transition: box-shadow 0.2s ease-in-out; }
-    [data-testid="stMetric"]:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    [data-testid="stMetricLabel"] { font-weight: 500; color: #555555; font-size: 0.9em; padding-bottom: 0.25rem; }
-    [data-testid="stMetricValue"] { font-weight: 700; font-size: 2em; color: #1E1E1E; line-height: 1.2; }
-    [data-testid="stMetricDelta"] { font-weight: 500; font-size: 0.95em; padding-top: 0.25rem; }
-    h2 { margin-bottom: 0.8rem; margin-top: 1.5rem; }
-    .stPlotlyChart { margin-bottom: 1.5rem; }
-</style>
-""", unsafe_allow_html=True)
+# --- Tải dữ liệu dựa trên lựa chọn ---
+limit_query = None
+if isinstance(num_points, int):
+    limit_query = num_points
 
+df_gold = load_data_from_db(limit=limit_query)
 
-# --- Data Fetching Function (World Gold & Forex) ---
-@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
-def fetch_world_historical_data(start_date, end_date):
-    """Fetches world gold and forex data. Returns (data, error_type)"""
-    try:
-        time.sleep(0.5)
-        gold_data = yf.download(GOLD_TICKER, start=start_date, end=end_date + timedelta(days=1), progress=False)
-        time.sleep(0.5)
-        forex_data = yf.download(FOREX_TICKER, start=start_date, end=end_date + timedelta(days=1), progress=False)
-        if gold_data.empty or forex_data.empty:
-            return (None, None), "nodata"
-        return (gold_data, forex_data), None
-    except Exception as e:
-        error_str = str(e).lower()
-        if 'ratelimit' in error_str or 'too many requests' in error_str:
-             print(f"Yahoo Finance Rate Limit Error (World Data): {e}")
-             return (None, None), "ratelimit"
-        else:
-             print(f"Error fetching world data: {e}")
-             return (None, None), "other"
+# --- Hiển thị biểu đồ và thông tin ---
+if not df_gold.empty:
+    st.subheader("Biểu đồ đường:")
+    # Vẽ biểu đồ đường
+    st.line_chart(df_gold)
 
-# --- Data Fetching Function (SJC Historical via vnstock) ---
-@st.cache_data(ttl=CACHE_TTL_SECONDS) # Increased TTL
-def fetch_sjc_historical_data(start_date, end_date):
-    """
-    Fetches historical SJC gold prices. Returns (dataframe, error_type)
-    """
-    all_sjc_prices = []
-    current_date = start_date
-    rate_limit_encountered = False
-    other_error_encountered = False
+    # Hiển thị giá mới nhất
+    latest_timestamp = df_gold.index[-1]
+    latest_price = df_gold['Giá Vàng TG (VND/cây)'].iloc[-1]
 
-    while current_date <= end_date:
-        date_str = current_date.strftime("%Y-%m-%d")
-        try:
-            time.sleep(0.2)
-            prices = sjc_gold_price(date=date_str)
-            if not prices.empty:
-                target_price = prices[prices['branch'] == SJC_TARGET_BRANCH]['sell_price']
-                if not target_price.empty:
-                    price_value = pd.to_numeric(str(target_price.iloc[0]).replace(',', ''), errors='coerce')
-                    if pd.notna(price_value):
-                         all_sjc_prices.append({'Timestamp': pd.to_datetime(current_date), 'Giá SJC (VND/cây)': price_value})
-        except Exception as e:
-            error_str = str(e).lower()
-            if 'ratelimit' in error_str or 'too many requests' in error_str:
-                 print(f"Rate Limit Error (SJC Data) on {date_str}: {e}")
-                 rate_limit_encountered = True
-            else:
-                 print(f"Error fetching SJC on {date_str}: {e}")
-                 other_error_encountered = True
+    st.subheader("Giá trị mới nhất:")
+    st.metric(label="Giá Vàng TG (VND/cây)",
+              value=f"{latest_price:,.2f} VND",
+              # Có thể thêm delta nếu muốn so sánh với điểm trước đó
+              # delta=f"{latest_price - df_gold['Giá Vàng TG (VND/cây)'].iloc[-2]:,.2f} VND" # Bỏ comment nếu muốn hiển thị thay đổi
+              )
+    st.caption(f"Thời điểm ghi nhận: {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        current_date += timedelta(days=SJC_FETCH_INTERVAL_DAYS)
-        if current_date <= end_date: time.sleep(SJC_FETCH_DELAY_SECONDS)
-
-    if not all_sjc_prices and (rate_limit_encountered or other_error_encountered):
-        error_type = "ratelimit" if rate_limit_encountered else "other"
-        return pd.DataFrame(), error_type
-    elif not all_sjc_prices:
-         return pd.DataFrame(), "nodata"
-    else:
-         return pd.DataFrame(all_sjc_prices), None
-
-
-# --- Calculation Function (World Gold VND) ---
-def calculate_world_gold_vnd(df_gold, df_forex):
-    if df_gold is None or df_forex is None or 'Close' not in df_gold.columns or 'Close' not in df_forex.columns:
-        return pd.DataFrame()
-    combined_data = pd.DataFrame(index=df_gold.index)
-    combined_data['Gold_USD_Oz'] = df_gold['Close']
-    combined_data['Forex_VND_USD'] = df_forex['Close']
-    combined_data.ffill(inplace=True); combined_data.dropna(inplace=True)
-    if combined_data.empty: return pd.DataFrame()
-    combined_data['Giá TG Quy Đổi (VND/cây)'] = combined_data['Gold_USD_Oz'] * combined_data['Forex_VND_USD'] * OUNCE_TO_CAY_FACTOR
-    combined_data.reset_index(inplace=True); combined_data.rename(columns={'Date': 'Timestamp'}, inplace=True)
-    combined_data['Timestamp'] = pd.to_datetime(combined_data['Timestamp'])
-    return combined_data[['Timestamp', 'Giá TG Quy Đổi (VND/cây)']]
-
-
-# --- Streamlit App Layout ---
-
-# --- Sidebar for Controls ---
-with st.sidebar:
-    st.image(LOGO_URL_SIDEBAR, width=100)
-    st.header("📅 Thời gian")
-    st.write("")
-
-    predefined_ranges = {
-        "1 Tháng": 30, "3 Tháng": 90, "6 Tháng": 180,
-        "1 Năm": 365, "Từ đầu năm (YTD)": "YTD", "Tất cả (Tối đa 10 năm)": "Max"
-    }
-    selected_range_label = st.selectbox("Chọn nhanh:", options=list(predefined_ranges.keys()), index=2)
-
-    st.divider()
-    st.markdown("**Hoặc chọn ngày:**")
-
-    today = datetime.now().date()
-    if selected_range_label == "Tất cả (Tối đa 10 năm)":
-        default_start_date_calc = max(today - timedelta(days=10*365), datetime(2015, 1, 1).date())
-    elif selected_range_label == "Từ đầu năm (YTD)":
-        default_start_date_calc = datetime(today.year, 1, 1).date()
-    else:
-        default_start_date_calc = today - timedelta(days=predefined_ranges[selected_range_label])
-    default_end_date_calc = today
-
-    start_date_input = st.date_input("Từ ngày", default_start_date_calc, label_visibility="collapsed")
-    end_date_input = st.date_input("Đến ngày", default_end_date_calc, label_visibility="collapsed")
-
-    start_date = start_date_input
-    end_date = end_date_input
-    final_label = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
-
-    if start_date > end_date:
-        st.error("Lỗi: Ngày bắt đầu không được sau ngày kết thúc.")
-        st.stop()
-
-    st.divider()
-    st.caption(f"SJC lấy mỗi {SJC_FETCH_INTERVAL_DAYS} ngày ({SJC_TARGET_BRANCH}).")
-
-
-# --- Main Page Layout ---
-st.title("📊 Biểu đồ Lịch sử Giá Vàng")
-st.caption(f"Giá TG quy đổi & Giá SJC | Khoảng thời gian: {final_label}")
-st.write("")
-
-# --- Initialize variables ---
-world_data_error = False
-sjc_data_error = False
-world_gold_vnd_hist = pd.DataFrame()
-sjc_hist = pd.DataFrame()
-gold_hist = None
-forex_hist = None
-spread_chart_data = pd.DataFrame()
-
-# --- Fetch World Data ---
-world_fetch_error_type = None
-fetch_world_success = False
-with st.spinner(f"Đang tải dữ liệu giá TG..."):
-    (gold_hist, forex_hist), world_fetch_error_type = fetch_world_historical_data(start_date, end_date)
-    if world_fetch_error_type:
-        world_data_error = True
-    elif gold_hist is None or forex_hist is None:
-         world_data_error = True
-    else:
-        world_gold_vnd_hist = calculate_world_gold_vnd(gold_hist, forex_hist)
-        if world_gold_vnd_hist.empty:
-            world_data_error = True
-        else:
-            fetch_world_success = True
-
-# Display world data status message outside spinner
-if world_fetch_error_type == "ratelimit":
-     st.warning("⚠️ **Giới hạn truy cập (Giá TG):** Máy chủ Yahoo Finance đang tạm thời giới hạn truy cập. Dữ liệu giá thế giới có thể không hiển thị. Vui lòng thử lại sau ít phút.", icon="⏳")
-elif world_fetch_error_type == "nodata":
-     st.info("ℹ️ Không tìm thấy dữ liệu giá thế giới cho khoảng thời gian này.")
-elif world_fetch_error_type == "other":
-     st.error("❌ Đã xảy ra lỗi khi tải dữ liệu giá thế giới.")
-# elif fetch_world_success: # Toast can be annoying if it appears too often
-#      st.toast("Tải dữ liệu giá thế giới thành công!", icon="✅")
-
-
-# --- Fetch SJC Data ---
-sjc_fetch_error_type = None
-fetch_sjc_success = False
-with st.spinner(f"Đang tải dữ liệu giá SJC (có thể mất vài phút)..."):
-     sjc_hist, sjc_fetch_error_type = fetch_sjc_historical_data(start_date, end_date)
-     if sjc_fetch_error_type:
-         sjc_data_error = True
-     elif sjc_hist.empty:
-         sjc_data_error = True
-         if sjc_fetch_error_type is None:
-             sjc_fetch_error_type = "nodata"
-     else:
-         sjc_hist['Timestamp'] = pd.to_datetime(sjc_hist['Timestamp'])
-         fetch_sjc_success = True
-
-# Display SJC status message outside spinner
-if sjc_fetch_error_type == "ratelimit":
-     st.warning(f"⚠️ **Giới hạn truy cập (Giá SJC):** Có thể đã gặp giới hạn khi lấy dữ liệu SJC. Dữ liệu SJC có thể không đầy đủ hoặc không hiển thị. Vui lòng thử lại sau.", icon="⏳")
-elif sjc_fetch_error_type == "nodata":
-     st.info(f"ℹ️ Không tìm thấy dữ liệu SJC nào cho khoảng thời gian này (dữ liệu được kiểm tra mỗi {SJC_FETCH_INTERVAL_DAYS} ngày).")
-elif sjc_fetch_error_type == "other":
-     st.error("❌ Đã xảy ra lỗi khi tải dữ liệu SJC.")
-# elif fetch_sjc_success:
-#      st.toast("Tải dữ liệu SJC thành công!", icon="✅")
-
-
-# --- Display Metrics ---
-# (Metric display logic remains the same)
-col1, col2, col3 = st.columns(3)
-def format_delta(delta_value):
-    if delta_value is None or pd.isna(delta_value): return None
-    sign = "+" if delta_value > 0 else ""
-    return f"{sign}{delta_value:,.0f} VND"
-latest_world_price = None; latest_world_date_str = "N/A"; delta_world = None
-if not world_data_error:
-    latest_world_price = world_gold_vnd_hist.iloc[-1]['Giá TG Quy Đổi (VND/cây)']
-    latest_world_date = world_gold_vnd_hist.iloc[-1]['Timestamp']
-    latest_world_date_str = latest_world_date.strftime('%d/%m')
-    if len(world_gold_vnd_hist) > 1:
-         prev_world_price = world_gold_vnd_hist.iloc[-2]['Giá TG Quy Đổi (VND/cây)']
-         if pd.notna(latest_world_price) and pd.notna(prev_world_price): delta_world = latest_world_price - prev_world_price
-with col1: st.metric(label=f"Giá TG Quy Đổi ({latest_world_date_str})", value=f"{latest_world_price:,.0f} VND" if pd.notna(latest_world_price) else "N/A", delta=format_delta(delta_world), help="Giá vàng thế giới quy đổi sang VND/cây (ngày gần nhất có dữ liệu)")
-latest_sjc_price = None; latest_sjc_date_str = "N/A"; delta_sjc = None
-if not sjc_data_error:
-    latest_sjc_price = sjc_hist.iloc[-1]['Giá SJC (VND/cây)']
-    latest_sjc_date = sjc_hist.iloc[-1]['Timestamp']
-    latest_sjc_date_str = latest_sjc_date.strftime('%d/%m')
-    if len(sjc_hist) > 1:
-         prev_sjc_price = sjc_hist.iloc[-2]['Giá SJC (VND/cây)']
-         if pd.notna(latest_sjc_price) and pd.notna(prev_sjc_price): delta_sjc = latest_sjc_price - prev_sjc_price
-with col2: st.metric(label=f"Giá SJC ({latest_sjc_date_str})", value=f"{latest_sjc_price:,.0f} VND" if pd.notna(latest_sjc_price) else "N/A", delta=format_delta(delta_sjc), help=f"Giá vàng SJC tại {SJC_TARGET_BRANCH} (ngày gần nhất có dữ liệu)")
-latest_spread = None; latest_spread_date_str = "N/A"; delta_spread = None; spread_calculated_for_metric = False
-if pd.notna(latest_world_price) and pd.notna(latest_sjc_price):
-    latest_spread = latest_sjc_price - latest_world_price
-    latest_spread_date_str = f"~ {datetime.now().strftime('%d/%m')}"
-    spread_calculated_for_metric = True
-with col3: st.metric(label=f"Chênh lệch ({latest_spread_date_str})", value=f"{latest_spread:,.0f} VND" if spread_calculated_for_metric else "N/A", delta=None, help="Chênh lệch giữa giá SJC và giá TG quy đổi mới nhất")
-
-st.divider()
-
-# --- Display World Gold Chart ---
-st.subheader("🌍 Giá Vàng Thế Giới (Quy đổi VND/cây)")
-if world_data_error and world_fetch_error_type != "ratelimit": # Only show info if not already showing rate limit warning
-    st.info("Không có dữ liệu giá vàng thế giới để hiển thị.")
-elif not world_data_error: # Plot if no error
-    fig_world = px.line(world_gold_vnd_hist, x='Timestamp', y='Giá TG Quy Đổi (VND/cây)', labels={'Timestamp': 'Thời gian', 'Giá TG Quy Đổi (VND/cây)': 'Giá (VND/cây)'})
-    fig_world.update_traces(line_color='#1f77b4', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Giá TG: %{y:,.0f}<extra></extra>")
-    fig_world.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
-    st.plotly_chart(fig_world, use_container_width=True)
-# If world_data_error is True due to rate limit, the warning is already shown above
-
-# --- Display SJC Chart ---
-st.subheader("🇻🇳 Giá Vàng SJC (VND/cây)")
-if sjc_data_error and sjc_fetch_error_type != "ratelimit": # Only show info if not already showing rate limit warning
-    st.info(f"Không có dữ liệu SJC để hiển thị.")
-elif not sjc_data_error: # Plot if no error
-    fig_sjc = px.line(sjc_hist, x='Timestamp', y='Giá SJC (VND/cây)', labels={'Timestamp': 'Thời gian', 'Giá SJC (VND/cây)': 'Giá (VND/cây)'}, markers=True)
-    fig_sjc.update_traces(line_color='#ff7f0e', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Giá SJC: %{y:,.0f}<extra></extra>")
-    fig_sjc.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
-    st.plotly_chart(fig_sjc, use_container_width=True)
-# If sjc_data_error is True due to rate limit, the warning is already shown above
-
-# --- Calculate and Display Spread Chart using Forward Fill ---
-st.subheader("⚖️ Chênh lệch Giá (SJC - Thế Giới Quy Đổi)")
-spread_chart_data = pd.DataFrame()
-spread_calculation_possible = False
-# Only attempt calculation if both fetches were potentially successful (even if calculation failed later)
-if not world_fetch_error_type and not sjc_fetch_error_type:
-    if not world_gold_vnd_hist.empty and not sjc_hist.empty:
-        spread_calculation_possible = True
-        try: # Add try-except for robustness during merge/ffill/calculation
-            date_range = pd.date_range(start=min(world_gold_vnd_hist['Timestamp'].min(), sjc_hist['Timestamp'].min()),
-                                       end=max(world_gold_vnd_hist['Timestamp'].max(), sjc_hist['Timestamp'].max()), freq='D')
-            spread_chart_data = pd.DataFrame(index=date_range)
-            spread_chart_data.index.name = 'Timestamp'
-            spread_chart_data = pd.merge(spread_chart_data, world_gold_vnd_hist.set_index('Timestamp'), left_index=True, right_index=True, how='left')
-            sjc_indexed = sjc_hist.set_index('Timestamp')
-            spread_chart_data = pd.merge(spread_chart_data, sjc_indexed, left_index=True, right_index=True, how='left')
-            spread_chart_data['Giá SJC (VND/cây)'].ffill(inplace=True)
-            spread_chart_data.dropna(subset=['Giá TG Quy Đổi (VND/cây)', 'Giá SJC (VND/cây)'], inplace=True)
-            if not spread_chart_data.empty:
-                spread_chart_data['Chênh lệch (SJC - TG)'] = spread_chart_data['Giá SJC (VND/cây)'] - spread_chart_data['Giá TG Quy Đổi (VND/cây)']
-                spread_chart_data.reset_index(inplace=True)
-            else:
-                 spread_calculation_possible = False
-        except Exception as e:
-            print(f"Error calculating spread chart data: {e}")
-            spread_calculation_possible = False
-            spread_chart_data = pd.DataFrame() # Ensure it's empty on error
-
-if not spread_calculation_possible or spread_chart_data.empty or 'Chênh lệch (SJC - TG)' not in spread_chart_data.columns:
-    st.info("Không thể tính hoặc vẽ biểu đồ chênh lệch (thiếu dữ liệu trùng khớp TG hoặc SJC).")
+    # Tùy chọn: Hiển thị bảng dữ liệu
+    if st.checkbox("Hiển thị dữ liệu dạng bảng"):
+        st.subheader("Dữ liệu chi tiết:")
+        # Định dạng lại cột giá trị để dễ đọc hơn trong bảng
+        df_display = df_gold.copy()
+        df_display['Giá Vàng TG (VND/cây)'] = df_display['Giá Vàng TG (VND/cây)'].map('{:,.2f}'.format)
+        st.dataframe(df_display.sort_index(ascending=False)) # Sắp xếp mới nhất lên đầu
 else:
-    fig_spread = px.line(spread_chart_data, x='Timestamp', y='Chênh lệch (SJC - TG)', labels={'Timestamp': 'Thời gian', 'Chênh lệch (SJC - TG)': 'Chênh lệch (VND/cây)'})
-    fig_spread.update_traces(line_color='#2ca02c', hovertemplate="Ngày: %{x|%d/%m/%Y}<br>Chênh lệch: %{y:,.0f}<extra></extra>")
-    fig_spread.update_layout(hovermode="x unified", margin=dict(t=10, b=0, l=0, r=0))
-    st.plotly_chart(fig_spread, use_container_width=True)
+    st.warning(f"Không tìm thấy dữ liệu trong file '{DB_FILE}' hoặc file không tồn tại. Hãy đảm bảo script thu thập dữ liệu đang chạy và lưu vào đúng file.")
 
-# --- Display Raw Data (Optional Expander) ---
-# (Raw data display logic remains the same)
-expander_title_parts = []
-if not world_data_error: expander_title_parts.append("TG Gốc")
-if not sjc_data_error: expander_title_parts.append("SJC Fetched")
-if expander_title_parts:
-    with st.expander(f"🔍 Xem dữ liệu gốc ({' & '.join(expander_title_parts)})"):
-        num_cols = len(expander_title_parts)
-        cols = st.columns(num_cols)
-        col_index = 0
-        if not world_data_error and gold_hist is not None and forex_hist is not None:
-            with cols[col_index]:
-                st.caption("Vàng TG (USD/oz)"); st.dataframe(gold_hist.style.format("{:,.2f}"), use_container_width=True, height=250)
-                st.caption("Tỷ giá USD/VND"); st.dataframe(forex_hist.style.format("{:,.2f}"), use_container_width=True, height=250)
-            col_index += 1
-        if not sjc_data_error and not sjc_hist.empty:
-             with cols[col_index]:
-                st.caption(f"Vàng SJC (mỗi {SJC_FETCH_INTERVAL_DAYS} ngày)"); st.dataframe(sjc_hist.set_index('Timestamp').style.format({'Giá SJC (VND/cây)': '{:,.0f}'}), use_container_width=True, height=250)
-
-
-# --- Footer ---
-st.divider()
-col_left, col_right = st.columns([0.7, 0.3])
-with col_left:
-     st.markdown(f"<p class='footer-caption'>Nguồn: Yahoo Finance (TG), vnstock (SJC). Tải lúc: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}</p>", unsafe_allow_html=True)
-with col_right:
-     st.markdown("<p class='footer-copyright'>Copyright ©LeQuyPhat</p>", unsafe_allow_html=True)
+st.sidebar.info("Lưu ý: Script thu thập dữ liệu gốc cần chạy để cập nhật file `gold_prices.db`.")
+st.sidebar.button("Làm mới dữ liệu") # Nút này sẽ trigger chạy lại script Streamlit và @st.cache_data sẽ kiểm tra ttl
